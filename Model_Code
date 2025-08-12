@@ -20,7 +20,7 @@ df = pd.read_excel(file_path)
 df['inv_WC'] = df['W/C'].apply(lambda x: 1 / x if x != 0 else 0)
 df['log_CuAg'] = np.log1p(df['CuAg'])  # log transform for curing age
 
-# New WGP-related engineered features (replacing WGP_Binder and inv_WGP)
+# New WGP-related engineered features 
 df['WGP_CEM'] = df.apply(lambda row: row['WGP'] / row['CEM'] if row['CEM'] != 0 else 0, axis=1)
 df['WGP_FA'] = df.apply(lambda row: row['WGP'] / row['FA'] if row['FA'] != 0 else 0, axis=1)
 df['WGP_WTR'] = df.apply(lambda row: row['WGP'] / row['WTR'] if row['WTR'] != 0 else 0, axis=1)
