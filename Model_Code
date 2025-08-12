@@ -1,0 +1,224 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Activation
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras import backend as K
+import warnings
+import tensorflow as tf
+warnings.filterwarnings("ignore")
+
+df = pd.read_excel(file_path)
+
+# -------- Updated Physics-Informed Feature Engineering --------
+df['inv_WC'] = df['W/C'].apply(lambda x: 1 / x if x != 0 else 0)
+df['log_CuAg'] = np.log1p(df['CuAg'])  # log transform for curing age
+
+# New WGP-related engineered features (replacing WGP_Binder and inv_WGP)
+df['WGP_CEM'] = df.apply(lambda row: row['WGP'] / row['CEM'] if row['CEM'] != 0 else 0, axis=1)
+df['WGP_FA'] = df.apply(lambda row: row['WGP'] / row['FA'] if row['FA'] != 0 else 0, axis=1)
+df['WGP_WTR'] = df.apply(lambda row: row['WGP'] / row['WTR'] if row['WTR'] != 0 else 0, axis=1)
+df['WBR'] = df['WTR'] / (df['CEM'] + df['WGP'])
+df['Total_Binder'] = df['CEM'] + df['WGP']
+df['Packing_Index'] = (df['CA'] + df['FA'] + df['WGP']) / df['Total_Binder']
+
+# Inputs and target
+X = df[['CEM', 'WTR', 'W/C', 'CA', 'FA', 'WGP', 'CuAg',
+        'inv_WC', 'log_CuAg', 'WGP_CEM', 'WGP_FA', 'WGP_WTR','WBR','Total_Binder','Packing_Index']]
+print(X.columns)
+print(X.head())
+print(X.shape)
+
+y = df['CS'].values
+
+# Standardize input
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Split: 80:10:10
+X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# -------- Custom Physics-Aware Loss Function --------
+def physics_informed_loss(y_true, y_pred):
+    mse = K.mean(K.square(y_true - y_pred))
+    penalty_neg = K.mean(K.relu(-y_pred))  # penalize predictions < 0
+    return mse + 0.1 * penalty_neg
+
+# -------- Improved Physics-Informed WGP-PiCS-Net --------
+model = Sequential()
+model.add(Dense(256, input_dim=X.shape[1], activation='relu'))
+model.add(BatchNormalization())
+model.add(Dropout(0.3))
+model.add(Dense(128, activation='relu'))
+model.add(BatchNormalization())
+model.add(Dropout(0.2))
+model.add(Dense(64, activation='relu'))
+model.add(Dense(1))
+model.add(Activation('relu'))  # Prevents negative CS predictions
+
+model.compile(optimizer='adam', loss=physics_informed_loss, metrics=['mae'])
+
+early_stop = EarlyStopping(patience=15, restore_best_weights=True)
+history = model.fit(X_train, y_train, validation_data=(X_val, y_val),
+                    epochs=300, batch_size=32, callbacks=[early_stop], verbose=0)
+
+# -------- Prediction --------
+y_pred_train = model.predict(X_train).flatten()
+y_pred_val = model.predict(X_val).flatten()
+y_pred_test = model.predict(X_test).flatten()
+
+# -------- Metrics --------
+def compute_metrics(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    a10 = np.mean(np.abs((y_true - y_pred) / y_true) <= 0.10) * 100
+    a20 = np.mean(np.abs((y_true - y_pred) / y_true) <= 0.20) * 100
+    return r2, mae, mape, mse, rmse, a10, a20
+
+for name, y_true, y_pred in zip(['Train', 'Validation', 'Test'],
+                                 [y_train, y_val, y_test],
+                                 [y_pred_train, y_pred_val, y_pred_test]):
+    r2, mae, mape, mse, rmse, a10, a20 = compute_metrics(y_true, y_pred)
+    print(f"\n{name} Metrics:")
+    print(f"R²: {r2:.4f}")
+    print(f"MAE: {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"A10 Index: {a10:.2f}%")
+    print(f"A20 Index: {a20:.2f}%")
+
+def get_linear_approx_eq(X_scaled, y_pred, feature_names):
+    lr = LinearRegression()
+    lr.fit(X_scaled, y_pred)
+    coefs = lr.coef_
+    intercept = lr.intercept_
+
+    equation = f"y = {intercept:.4f}"
+    for coef, fname in zip(coefs, feature_names):
+        sign = "+" if coef >= 0 else "-"
+        equation += f" {sign} {abs(coef):.4f}*{fname}"
+    return equation
+
+feature_names = X.columns.tolist()
+
+for set_name, X_scaled, y_pred in [('Training', X_train, y_pred_train),
+                                   ('Validation', X_val, y_pred_val),
+                                   ('Testing', X_test, y_pred_test)]:
+    eq = get_linear_approx_eq(X_scaled, y_pred, feature_names)
+    print(f"{set_name} Linear Approximation of WGP-PiCS-Net:\n{eq}\n")
+
+# Entire dataset
+X_scaled_all = scaler.transform(X)
+y_pred_all = model.predict(X_scaled_all).flatten()
+eq_all = get_linear_approx_eq(X_scaled_all, y_pred_all, feature_names)
+print(f"Entire Dataset Linear Approximation of WGP-PiCS-Net:\n{eq_all}\n")
+
+# Plot training history
+plt.figure(figsize=(4, 3))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Loss (MSE)')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(False)
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['mae'], label='Training MAE')
+plt.plot(history.history['val_mae'], label='Validation MAE')
+plt.title('Mean Absolute Error')
+plt.xlabel('Epoch')
+plt.ylabel('MAE')
+plt.legend()
+plt.grid(False)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(4, 3),dpi=150)
+
+# Plot Training
+plt.plot(y_train, label='Train Actual', linestyle='-',marker='o',markersize=2)
+plt.plot(y_pred_train, label='Train Predicted', linestyle='--',marker='o',markersize=2)
+
+# Plot Validation
+plt.plot(range(len(y_train), len(y_train) + len(y_val)), y_val, label='Val_Actual', color='hotpink', linestyle='-',marker='o',markersize=2)
+plt.plot(range(len(y_train), len(y_train) + len(y_val)), y_pred_val, label='Val_Predicted', color='turquoise', linestyle='--',marker='o',markersize=2)
+
+# Plot Testing
+plt.plot(range(len(y_train) + len(y_val), len(y_train) + len(y_val) + len(y_test)), y_test, label='Test Actual', color='lime', linestyle='-',marker='o',markersize=2)
+plt.plot(range(len(y_train) + len(y_val), len(y_train) + len(y_val) + len(y_test)), y_pred_test, label='Test Predicted', color='salmon',linestyle='--',marker='o',markersize=2)
+
+plt.xlabel('Sample Index')
+plt.ylabel('CS Value')
+plt.title('WGP-PiCS-Net - Actual vs Predicted',fontweight='bold')
+plt.legend(fontsize=6)
+plt.grid(False)
+plt.show()
+
+plt.figure(figsize=(4, 3), dpi=150)
+# Plot Training (scatter)
+plt.scatter(range(len(y_train)), y_train, label='Train Actual', marker='o', s=10)
+plt.scatter(range(len(y_train)), y_pred_train, label='Train Predicted', marker='x', s=10)
+# Plot Validation (scatter)
+plt.scatter(range(len(y_train), len(y_train) + len(y_val)), y_val, label='Val Actual', color='hotpink', marker='o', s=10)
+plt.scatter(range(len(y_train), len(y_train) + len(y_val)), y_pred_val, label='Val Predicted', color='turquoise', marker='x', s=10)
+# Plot Testing (scatter)
+plt.scatter(range(len(y_train) + len(y_val), len(y_train) + len(y_val) + len(y_test)), y_test, label='Test Actual', color='lime', marker='o', s=10)
+plt.scatter(range(len(y_train) + len(y_val), len(y_train) + len(y_val) + len(y_test)), y_pred_test, label='Test Predicted', color='salmon', marker='x', s=10)
+
+plt.xlabel('Sample Index')
+plt.ylabel('CS Value')
+plt.title('WGP-PiCS-Net - Actual vs Predicted', fontweight='bold')
+plt.legend(fontsize=6)
+plt.grid(False)
+plt.show()
+
+# Create a figure and axis object for seaborn regplots
+fig, ax = plt.subplots(figsize=(4,3), dpi=150)
+
+def plot_regression_line(x, y, color, label):
+    sns.regplot(x=x, y=y, scatter=False, ax=ax, color=color, label=label, line_kws={'linewidth':2})
+
+# Plot regression lines on actual vs predicted (for each set)
+plot_regression_line(y_train, y_pred_train, 'hotpink', 'Train Regression')
+plot_regression_line(y_val, y_pred_val, 'blue', 'Validation Regression')
+plot_regression_line(y_test, y_pred_test, 'orange', 'Test Regression')
+
+# Scatter plots
+ax.scatter(y_train, y_pred_train, color=colors['Train Predicted'], marker=markers['Train Predicted'], s=30, label='Train Actual vs Predicted')
+ax.scatter(y_val, y_pred_val, color=colors['Val Predicted'], marker=markers['Val Predicted'], s=30, label='Validation Actual vs Predicted')
+ax.scatter(y_test, y_pred_test, color=colors['Test Predicted'], marker=markers['Test Predicted'], s=30, label='Test Actual vs Predicted')
+
+# Get limits for the perfect prediction line and tolerance bands
+min_val = min(ax.get_xlim()[0], ax.get_ylim()[0])
+max_val = max(ax.get_xlim()[1], ax.get_ylim()[1])
+
+# Perfect prediction line
+ax.plot([min_val, max_val], [min_val, max_val], 'k--', label='Perfect Prediction')
+
+# ±10 and ±20 tolerance bands
+ax.plot([min_val, max_val], [min_val + 10, max_val + 10], 'r--', linewidth=1, label='±10 Band')
+ax.plot([min_val, max_val], [min_val - 10, max_val - 10], 'r--', linewidth=1)
+ax.plot([min_val, max_val], [min_val + 20, max_val + 20], 'g--', linewidth=1, label='±20 Band')
+ax.plot([min_val, max_val], [min_val - 20, max_val - 20], 'g--', linewidth=1)
+
+# Final plot formatting
+ax.set_xlabel('Actual CS')
+ax.set_ylabel('Predicted CS')
+ax.set_title('WGP-PiCS-Net - Actual vs Predicted', fontweight='bold')
+ax.legend(fontsize=6)
+ax.grid(False)
+plt.show()
